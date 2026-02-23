@@ -1,0 +1,65 @@
+[project]
+name = "mlx-gpt-oss"
+version = "0.1.0"
+description = "Minimal OpenAI-compatible server for GPT-OSS models on Apple Silicon with MLX"
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  {name = "Hayssam Keilany"},
+]
+keywords = [
+  "gpt-oss",
+  "harmony",
+  "mlx",
+  "fastapi",
+  "openai-compatible",
+  "minimal",
+  "mlx-lm",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+license-files = ["LICENSE"]
+
+dependencies = [
+  "fastapi>=0.115,<1",
+  "mlx-lm>=0.30,<1",
+  "openai-harmony>=0.0.8,<1",
+  "loguru>=0.7,<1",
+  "pydantic>=2,<3",
+  "uvicorn>=0.35,<1",
+]
+
+[project.scripts]
+mlx-gpt-oss = "server:main"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "httpx>=0.27,<1",
+  "pytest>=8,<10",
+  "twine>=5,<7",
+]
+
+[dependency-groups]
+dev = [
+  "build>=1.2,<2",
+  "httpx>=0.27,<1",
+  "pytest>=8,<10",
+  "twine>=5,<7",
+]
+
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["server", "harmony", "schemas"]
