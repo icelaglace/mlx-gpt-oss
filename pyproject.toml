@@ -1,6 +1,6 @@
 [project]
 name = "mlx-gpt-oss"
-version = "0.1.0"
+version = "1.0.0"
 description = "Minimal OpenAI-compatible server for GPT-OSS models on Apple Silicon with MLX"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.11"
@@ -18,7 +18,7 @@ keywords = [
   "mlx-lm",
 ]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "Operating System :: MacOS :: MacOS X",
   "Programming Language :: Python :: 3",
@@ -27,7 +27,7 @@ classifiers = [
   "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-license-files = ["LICENSE"]
+license-files = ["LICEN[CS]E*"]
 
 dependencies = [
   "fastapi>=0.115,<1",
@@ -41,6 +41,11 @@ dependencies = [
 [project.scripts]
 mlx-gpt-oss = "server:main"
 
+[project.urls]
+Homepage = "https://github.com/icelaglace/mlx-gpt-oss"
+Repository = "https://github.com/icelaglace/mlx-gpt-oss"
+Issues = "https://github.com/icelaglace/mlx-gpt-oss/issues"
+
 [project.optional-dependencies]
 dev = [
   "build>=1.2,<2",
@@ -49,13 +54,6 @@ dev = [
   "twine>=5,<7",
 ]
 
-[dependency-groups]
-dev = [
-  "build>=1.2,<2",
-  "httpx>=0.27,<1",
-  "pytest>=8,<10",
-  "twine>=5,<7",
-]
 
 [build-system]
 requires = ["setuptools>=77.0.3", "wheel"]
