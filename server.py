@@ -27,6 +27,19 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from harmony import HarmonyParser, get_stop_tokens, render_harmony_prompt
+from protocol import (
+    InvalidRequestError,
+    NormalizedStreamEvent,
+    NormalizedToolCall,
+    NormalizedTurnRequest,
+    NormalizedTurnResult,
+    NormalizedUsage,
+    build_assistant_transcript_message,
+    build_response_output_items,
+    normalize_chat_request,
+    normalize_responses_request,
+)
+from response_store import ResponseStore, StoredResponseRecord
 from schemas import (
     ChatCompletionChunk,
     ChatCompletionMessageToolCall,
@@ -41,6 +54,12 @@ from schemas import (
     Message,
     Model,
     ModelsResponse,
+    ResponseDeleted,
+    ResponseInputItemsList,
+    ResponseObject,
+    ResponseUsage,
+    ResponseUsageDetails,
+    ResponsesCreateRequest,
     StreamingChoice,
     UsageInfo,
 )
@@ -224,13 +243,15 @@ class RequestQueue:
     """
 
     def __init__(self) -> None:
+        self._maxsize = 32
         self._queue: asyncio.Queue[
             tuple[asyncio.Future[Any], Any, tuple[Any, ...], dict[str, Any]]
-        ] = asyncio.Queue(maxsize=32)
+        ] = asyncio.Queue(maxsize=self._maxsize)
         self._active = 0
         self._worker: asyncio.Task | None = None
 
     async def start(self) -> None:
+        self._queue = asyncio.Queue(maxsize=self._maxsize)
         self._worker = asyncio.create_task(self._loop())
         logger.opt(colors=True).info( "Server is <green>ready</green>" )
 
@@ -241,6 +262,7 @@ class RequestQueue:
                 await self._worker
             except asyncio.CancelledError:
                 pass
+            self._worker = None
 
     def stats(self) -> dict[str, int]:
         return {"active_requests": self._active, "queued_requests": self._queue.qsize()}
@@ -458,7 +480,7 @@ def _normalize_finish_reason(finish_reason: Any) -> str:
 
 
 def _resolve_sampling_params(
-    request: ChatCompletionRequest,
+    request: Any,
 ) -> tuple[float, float, int, float, int]:
     temperature = (
         request.temperature if request.temperature is not None else _DEFAULT_TEMP
@@ -506,19 +528,14 @@ def _response_model_id(request_model: str) -> str:
 
 
 def _prepare_prompt(
-    request: ChatCompletionRequest,
+    request: Any,
     *,
     request_log_id: str | None = None,
 ) -> list[int]:
     """Build input_ids from the request messages."""
-    reasoning_effort = request.reasoning_effort
-    if (
-        request.reasoning_effort is None
-        and request.chat_template_kwargs
-        and isinstance(request.chat_template_kwargs.get("reasoning_effort"), str)
-    ):
-        reasoning_effort = request.chat_template_kwargs["reasoning_effort"]
-    reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    reasoning_effort = _normalize_reasoning_effort(
+        getattr(request, "reasoning_effort", None)
+    )
 
     prompt_str = render_harmony_prompt(
         messages=request.messages,
@@ -538,11 +555,95 @@ def _prepare_prompt(
     return _model.tokenize(prompt_str)
 
 
-async def _generate_response(
-    request: ChatCompletionRequest,
+def _build_normalized_tool_calls(
+    tool_calls: list[dict[str, Any]] | None,
+) -> list[NormalizedToolCall]:
+    normalized_tool_calls: list[NormalizedToolCall] = []
+    for tool_call in tool_calls or []:
+        normalized_tool_call = _normalize_tool_call(tool_call)
+        if normalized_tool_call is None:
+            continue
+        tool_name, arguments = normalized_tool_call
+        normalized_tool_calls.append(
+            NormalizedToolCall(
+                id=_new_prefixed_id("call"),
+                name=tool_name,
+                arguments=arguments,
+            )
+        )
+    return normalized_tool_calls
+
+
+def _turn_result_from_parsed(
+    parsed: dict[str, Any],
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    finish_reason: str = "stop",
+    tool_calls: list[NormalizedToolCall] | None = None,
+) -> NormalizedTurnResult:
+    resolved_tool_calls = (
+        list(tool_calls) if tool_calls is not None else _build_normalized_tool_calls(parsed.get("tool_calls"))
+    )
+    resolved_finish_reason = "tool_calls" if resolved_tool_calls else finish_reason
+    usage = NormalizedUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
+    return NormalizedTurnResult(
+        model=model,
+        content=parsed.get("content"),
+        reasoning_content=parsed.get("reasoning_content"),
+        tool_calls=resolved_tool_calls,
+        finish_reason=resolved_finish_reason,
+        usage=usage,
+    )
+
+
+def _format_chat_completion_from_result(
+    result: NormalizedTurnResult,
+) -> ChatCompletionResponse:
+    tc_objects = [
+        ChatCompletionMessageToolCall(
+            id=tool_call.id,
+            function=FunctionCall(
+                name=tool_call.name,
+                arguments=tool_call.arguments,
+            ),
+            index=index,
+        )
+        for index, tool_call in enumerate(result.tool_calls)
+    ]
+    return ChatCompletionResponse(
+        id=_new_prefixed_id("chatcmpl"),
+        created=int(time.time()),
+        model=result.model,
+        choices=[
+            Choice(
+                message=Message(
+                    role="assistant",
+                    content=result.content,
+                    reasoning_content=result.reasoning_content,
+                    tool_calls=tc_objects or None,
+                ),
+                finish_reason=result.finish_reason,
+            )
+        ],
+        usage=UsageInfo(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+        ),
+    )
+
+
+async def _generate_turn_result(
+    request: NormalizedTurnRequest,
     *,
     request_log_id: str | None = None,
-) -> ChatCompletionResponse:
+) -> NormalizedTurnResult:
     """Non-streaming generation — runs inference in a thread."""
     log_id = request_log_id or _new_request_log_id()
     request_start_ts = time.time()
@@ -602,8 +703,7 @@ async def _generate_response(
     parsed = parser.parse(full_text)
     parsed["content"], _ = _truncate_text_at_stop(parsed.get("content"), stop_sequences)
 
-    # Build response.
-    response = _format_response(
+    result = _turn_result_from_parsed(
         parsed,
         _response_model_id(request.model),
         prompt_len,
@@ -623,7 +723,19 @@ async def _generate_response(
         completion_tokens / elapsed_s if completion_tokens else 0.0,
     )
 
-    return response
+    return result
+
+
+async def _generate_response(
+    request: ChatCompletionRequest,
+    *,
+    request_log_id: str | None = None,
+) -> ChatCompletionResponse:
+    result = await _generate_turn_result(
+        normalize_chat_request(request),
+        request_log_id=request_log_id,
+    )
+    return _format_chat_completion_from_result(result)
 
 
 def _format_response(
@@ -635,47 +747,14 @@ def _format_response(
     finish_reason: str = "stop",
 ) -> ChatCompletionResponse:
     """Format parsed result into an OpenAI chat completion response."""
-    tool_calls = parsed.get("tool_calls") or []
-
-    tc_objects = []
-    for tc in tool_calls:
-        normalized_tool_call = _normalize_tool_call(tc)
-        if normalized_tool_call is None:
-            continue
-        sanitized_name, args = normalized_tool_call
-        tc_objects.append(
-            ChatCompletionMessageToolCall(
-                id=_new_prefixed_id("call"),
-                function=FunctionCall(
-                    name=sanitized_name,
-                    arguments=args,
-                ),
-                index=len(tc_objects),
-            )
+    return _format_chat_completion_from_result(
+        _turn_result_from_parsed(
+            parsed,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            finish_reason=finish_reason,
         )
-
-    resolved_finish_reason = "tool_calls" if tc_objects else finish_reason
-
-    return ChatCompletionResponse(
-        id=_new_prefixed_id("chatcmpl"),
-        created=int(time.time()),
-        model=model,
-        choices=[
-            Choice(
-                message=Message(
-                    role="assistant",
-                    content=parsed.get("content"),
-                    reasoning_content=parsed.get("reasoning_content"),
-                    tool_calls=tc_objects or None,
-                ),
-                finish_reason=resolved_finish_reason,
-            )
-        ],
-        usage=UsageInfo(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
     )
 
 
@@ -712,59 +791,21 @@ class _StreamRequestContext:
 
 
 def _stream_chunk(
-    context: _StreamRequestContext,
     *,
+    chat_id: str,
+    created: int,
+    model: str,
     delta: Delta,
     finish_reason: str | None = None,
     usage: UsageInfo | None = None,
 ) -> ChatCompletionChunk:
     return ChatCompletionChunk(
-        id=context.chat_id,
-        created=context.created,
-        model=context.model,
+        id=chat_id,
+        created=created,
+        model=model,
         choices=[StreamingChoice(delta=delta, finish_reason=finish_reason)],
         usage=usage,
     )
-
-
-def _build_stream_tool_call_chunks(
-    tool_calls: list[dict[str, Any]],
-    *,
-    context: _StreamRequestContext,
-    tool_call_index: int,
-) -> tuple[list[ChatCompletionChunk], int, list[tuple[str, str]]]:
-    chunks: list[ChatCompletionChunk] = []
-    emitted_tool_calls: list[tuple[str, str]] = []
-    for tool_call in tool_calls:
-        normalized_tool_call = _normalize_tool_call(
-            tool_call,
-            warning_label="stream tool call",
-        )
-        if normalized_tool_call is None:
-            continue
-
-        tool_name, arguments = normalized_tool_call
-        emitted_tool_calls.append((tool_name, arguments))
-        tool_call_index += 1
-        chunks.append(
-            _stream_chunk(
-                context,
-                delta=Delta(
-                    tool_calls=[
-                        ChoiceDeltaToolCall(
-                            index=tool_call_index,
-                            id=_new_prefixed_id("call"),
-                            function=ChoiceDeltaFunctionCall(
-                                name=tool_name,
-                                arguments=arguments,
-                            ),
-                        )
-                    ],
-                ),
-            )
-        )
-
-    return chunks, tool_call_index, emitted_tool_calls
 
 
 @dataclass
@@ -773,12 +814,11 @@ class _StreamState:
 
     finish_reason: str = "stop"
     completion_tokens: int = 0
-    tool_call_index: int = -1
     stop_tail: str = ""
     raw_output_parts: list[str] = field(default_factory=list)
     emitted_content_parts: list[str] = field(default_factory=list)
     emitted_reasoning_parts: list[str] = field(default_factory=list)
-    emitted_tool_calls: list[tuple[str, str]] = field(default_factory=list)
+    emitted_tool_calls: list[NormalizedToolCall] = field(default_factory=list)
     raw_preview_parts: list[str] = field(default_factory=list)
     raw_preview_len: int = 0
     raw_text_fallback: bool = False
@@ -787,7 +827,7 @@ class _StreamState:
 
 
 def _build_stream_request_context(
-    request: ChatCompletionRequest,
+    request: Any,
     *,
     request_log_id: str | None = None,
 ) -> _StreamRequestContext:
@@ -891,7 +931,251 @@ async def _stream_response(
     *,
     request_log_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """SSE streaming generator matching the OpenAI protocol."""
+    """SSE streaming generator matching the OpenAI chat protocol."""
+    normalized_request = normalize_chat_request(request)
+    chat_id = _new_prefixed_id("chatcmpl")
+    created = int(time.time())
+    model = _response_model_id(normalized_request.model)
+    tool_call_index = -1
+    saw_terminal_event = False
+
+    yield _sse(
+        _stream_chunk(
+            chat_id=chat_id,
+            created=created,
+            model=model,
+            delta=Delta(role="assistant"),
+        )
+    )
+
+    async for event in _stream_events(
+        normalized_request,
+        client_request=client_request,
+        request_log_id=request_log_id,
+    ):
+        if event.kind == "text_delta" and event.text:
+            yield _sse(
+                _stream_chunk(
+                    chat_id=chat_id,
+                    created=created,
+                    model=model,
+                    delta=Delta(content=event.text),
+                )
+            )
+            continue
+
+        if event.kind == "reasoning_delta" and event.text:
+            yield _sse(
+                _stream_chunk(
+                    chat_id=chat_id,
+                    created=created,
+                    model=model,
+                    delta=Delta(reasoning_content=event.text),
+                )
+            )
+            continue
+
+        if event.kind == "function_call" and event.tool_call is not None:
+            tool_call_index += 1
+            yield _sse(
+                _stream_chunk(
+                    chat_id=chat_id,
+                    created=created,
+                    model=model,
+                    delta=Delta(
+                        tool_calls=[
+                            ChoiceDeltaToolCall(
+                                index=tool_call_index,
+                                id=event.tool_call.id,
+                                function=ChoiceDeltaFunctionCall(
+                                    name=event.tool_call.name,
+                                    arguments=event.tool_call.arguments,
+                                ),
+                            )
+                        ]
+                    ),
+                )
+            )
+            continue
+
+        if event.kind in {"completed", "failed"} and event.result is not None:
+            saw_terminal_event = True
+            usage = UsageInfo(
+                prompt_tokens=event.result.usage.prompt_tokens,
+                completion_tokens=event.result.usage.completion_tokens,
+                total_tokens=event.result.usage.total_tokens,
+            )
+            yield _sse(
+                _stream_chunk(
+                    chat_id=chat_id,
+                    created=created,
+                    model=model,
+                    delta=Delta(),
+                    finish_reason=event.result.finish_reason,
+                    usage=usage,
+                )
+            )
+            break
+
+    if not saw_terminal_event:
+        return
+
+    yield "data: [DONE]\n\n"
+
+
+def _stream_state_tool_pairs(state: _StreamState) -> list[tuple[str, str]]:
+    return [(tool_call.name, tool_call.arguments) for tool_call in state.emitted_tool_calls]
+
+
+def _build_stream_tool_call_events(
+    tool_calls: list[dict[str, Any]],
+    *,
+    state: _StreamState,
+) -> list[NormalizedStreamEvent]:
+    pending_tool_calls = _drop_emitted_tool_call_prefix(
+        tool_calls,
+        _stream_state_tool_pairs(state),
+    )
+    events: list[NormalizedStreamEvent] = []
+    for tool_call in pending_tool_calls:
+        normalized_tool_call = _normalize_tool_call(
+            tool_call,
+            warning_label="stream tool call",
+        )
+        if normalized_tool_call is None:
+            continue
+        tool_name, arguments = normalized_tool_call
+        normalized_event_tool_call = NormalizedToolCall(
+            id=_new_prefixed_id("call"),
+            name=tool_name,
+            arguments=arguments,
+        )
+        state.emitted_tool_calls.append(normalized_event_tool_call)
+        events.append(
+            NormalizedStreamEvent(
+                kind="function_call",
+                tool_call=normalized_event_tool_call,
+            )
+        )
+    if events:
+        state.finish_reason = "tool_calls"
+    return events
+
+
+def _should_reparse_stream_output(
+    raw_text: str,
+    *,
+    raw_text_fallback: bool,
+) -> bool:
+    if not raw_text:
+        return False
+    if raw_text_fallback:
+        return True
+    if "to=functions." not in raw_text:
+        return False
+    if not any(marker in raw_text for marker in ("<|channel|>", "<|start|>", "<|call|>")):
+        return False
+    return any(marker in raw_text for marker in ("<|message|>", "<|constrain|>", "<|call|>"))
+
+
+def _should_parse_tool_calls_from_raw_stream_output(
+    raw_text: str,
+    *,
+    parse_tools: bool,
+) -> bool:
+    if not parse_tools or "to=functions." not in raw_text:
+        return False
+    if not any(marker in raw_text for marker in ("<|channel|>", "<|start|>", "<|call|>")):
+        return False
+    return any(marker in raw_text for marker in ("<|message|>", "<|constrain|>", "<|call|>"))
+
+
+def _build_reparsed_stream_events(
+    raw_text: str,
+    *,
+    parse_tools: bool,
+    stop_sequences: list[str],
+    state: _StreamState,
+) -> list[NormalizedStreamEvent]:
+    parsed = _parse_streaming_fallback_output(
+        raw_text,
+        parse_tools=_should_parse_tool_calls_from_raw_stream_output(
+            raw_text,
+            parse_tools=parse_tools,
+        ),
+    )
+    events: list[NormalizedStreamEvent] = []
+
+    reasoning_content = parsed.get("reasoning_content")
+    if reasoning_content:
+        reasoning_content = _only_unseen_suffix(
+            reasoning_content,
+            "".join(state.emitted_reasoning_parts),
+        )
+    if reasoning_content:
+        state.emitted_reasoning_parts.append(reasoning_content)
+        events.append(
+            NormalizedStreamEvent(
+                kind="reasoning_delta",
+                text=reasoning_content,
+            )
+        )
+
+    parsed_content = parsed.get("content")
+    if parsed_content:
+        parsed_content, _ = _truncate_text_at_stop(
+            parsed_content,
+            stop_sequences,
+        )
+        parsed_content = _only_unseen_suffix(
+            parsed_content,
+            "".join(state.emitted_content_parts),
+        )
+    if parsed_content:
+        state.emitted_content_parts.append(parsed_content)
+        events.append(
+            NormalizedStreamEvent(
+                kind="text_delta",
+                text=parsed_content,
+            )
+        )
+
+    if parse_tools and parsed.get("tool_calls"):
+        events.extend(
+            _build_stream_tool_call_events(
+                parsed["tool_calls"],
+                state=state,
+            )
+        )
+
+    return events
+
+
+def _build_stream_result(
+    context: _StreamRequestContext,
+    state: _StreamState,
+) -> NormalizedTurnResult:
+    return NormalizedTurnResult(
+        model=context.model,
+        content="".join(state.emitted_content_parts) or None,
+        reasoning_content="".join(state.emitted_reasoning_parts) or None,
+        tool_calls=list(state.emitted_tool_calls),
+        finish_reason=state.finish_reason,
+        usage=NormalizedUsage(
+            prompt_tokens=context.prompt_len,
+            completion_tokens=state.completion_tokens,
+            total_tokens=context.prompt_len + state.completion_tokens,
+        ),
+    )
+
+
+async def _stream_events(
+    request: NormalizedTurnRequest,
+    client_request: Request | None = None,
+    *,
+    request_log_id: str | None = None,
+) -> AsyncGenerator[NormalizedStreamEvent, None]:
+    """Internal streaming generator yielding transport-neutral events."""
     global _stream_active_requests
     context = _build_stream_request_context(
         request,
@@ -903,9 +1187,6 @@ async def _stream_response(
     stop_event = Event()
     worker_failed = Event()
     _stream_active_requests += 1
-
-    # First chunk: role-only delta (OpenAI convention).
-    yield _sse(_stream_chunk(context, delta=Delta(role="assistant")))
 
     # Run inference in background thread, feed chunks through an async queue.
     chunk_queue: asyncio.Queue[tuple[str, str | None, int] | None] = asyncio.Queue()
@@ -946,8 +1227,9 @@ async def _stream_response(
                     state.stream_cancel_reason = "worker_error"
                 if stop_sequences and state.stop_tail:
                     state.emitted_content_parts.append(state.stop_tail)
-                    yield _sse(
-                        _stream_chunk(context, delta=Delta(content=state.stop_tail))
+                    yield NormalizedStreamEvent(
+                        kind="text_delta",
+                        text=state.stop_tail,
                     )
                     state.stop_tail = ""
 
@@ -963,84 +1245,24 @@ async def _stream_response(
                         state.raw_text_fallback = True
                         flushed = None
                     if flushed and flushed.get("tool_calls"):
-                        pending_tool_calls = _drop_emitted_tool_call_prefix(
+                        for event in _build_stream_tool_call_events(
                             flushed["tool_calls"],
-                            state.emitted_tool_calls,
-                        )
-                        (
-                            tool_call_chunks,
-                            state.tool_call_index,
-                            emitted_tool_calls,
-                        ) = (
-                            _build_stream_tool_call_chunks(
-                                pending_tool_calls,
-                                context=context,
-                                tool_call_index=state.tool_call_index,
-                            )
-                        )
-                        state.emitted_tool_calls.extend(emitted_tool_calls)
-                        if tool_call_chunks:
-                            state.finish_reason = "tool_calls"
-                        for chunk_item in tool_call_chunks:
-                            yield _sse(chunk_item)
+                            state=state,
+                        ):
+                            yield event
 
-                if state.raw_text_fallback and state.raw_output_parts:
-                    parsed = _parse_streaming_fallback_output(
-                        "".join(state.raw_output_parts),
+                raw_text = "".join(state.raw_output_parts)
+                if _should_reparse_stream_output(
+                    raw_text,
+                    raw_text_fallback=state.raw_text_fallback,
+                ):
+                    for event in _build_reparsed_stream_events(
+                        raw_text,
                         parse_tools=parse_tools,
-                    )
-                    reasoning_content = parsed.get("reasoning_content")
-                    if reasoning_content:
-                        reasoning_content = _only_unseen_suffix(
-                            reasoning_content,
-                            "".join(state.emitted_reasoning_parts),
-                        )
-                    if reasoning_content:
-                        state.emitted_reasoning_parts.append(reasoning_content)
-                        yield _sse(
-                            _stream_chunk(
-                                context,
-                                delta=Delta(reasoning_content=reasoning_content),
-                            )
-                        )
-
-                    parsed_content = parsed.get("content")
-                    if parsed_content:
-                        parsed_content, _ = _truncate_text_at_stop(
-                            parsed_content,
-                            stop_sequences,
-                        )
-                        parsed_content = _only_unseen_suffix(
-                            parsed_content,
-                            "".join(state.emitted_content_parts),
-                        )
-                    if parsed_content:
-                        state.emitted_content_parts.append(parsed_content)
-                        yield _sse(
-                            _stream_chunk(context, delta=Delta(content=parsed_content))
-                        )
-
-                    if parse_tools and parsed.get("tool_calls"):
-                        pending_tool_calls = _drop_emitted_tool_call_prefix(
-                            parsed["tool_calls"],
-                            state.emitted_tool_calls,
-                        )
-                        (
-                            tool_call_chunks,
-                            state.tool_call_index,
-                            emitted_tool_calls,
-                        ) = (
-                            _build_stream_tool_call_chunks(
-                                pending_tool_calls,
-                                context=context,
-                                tool_call_index=state.tool_call_index,
-                            )
-                        )
-                        state.emitted_tool_calls.extend(emitted_tool_calls)
-                        if tool_call_chunks:
-                            state.finish_reason = "tool_calls"
-                        for chunk_item in tool_call_chunks:
-                            yield _sse(chunk_item)
+                        stop_sequences=stop_sequences,
+                        state=state,
+                    ):
+                        yield event
                 break
 
             token_text, model_finish_reason, generated_count = chunk
@@ -1086,11 +1308,9 @@ async def _stream_response(
             reasoning_content = parsed.get("reasoning_content")
             if reasoning_content:
                 state.emitted_reasoning_parts.append(reasoning_content)
-                yield _sse(
-                    _stream_chunk(
-                        context,
-                        delta=Delta(reasoning_content=reasoning_content),
-                    )
+                yield NormalizedStreamEvent(
+                    kind="reasoning_delta",
+                    text=reasoning_content,
                 )
 
             # Emit content delta.
@@ -1110,31 +1330,26 @@ async def _stream_response(
                         state.finish_reason = "stop"
                         if emit_text:
                             state.emitted_content_parts.append(emit_text)
-                            yield _sse(
-                                _stream_chunk(context, delta=Delta(content=emit_text))
+                            yield NormalizedStreamEvent(
+                                kind="text_delta",
+                                text=emit_text,
                             )
                         break
                     content_delta = emit_text
                 if content_delta:
                     state.emitted_content_parts.append(content_delta)
-                    yield _sse(
-                        _stream_chunk(context, delta=Delta(content=content_delta))
+                    yield NormalizedStreamEvent(
+                        kind="text_delta",
+                        text=content_delta,
                     )
 
             # Emit tool call deltas.
             if parse_tools and parsed.get("tool_calls"):
-                tool_call_chunks, state.tool_call_index, emitted_tool_calls = (
-                    _build_stream_tool_call_chunks(
-                        parsed["tool_calls"],
-                        context=context,
-                        tool_call_index=state.tool_call_index,
-                    )
-                )
-                state.emitted_tool_calls.extend(emitted_tool_calls)
-                if tool_call_chunks:
-                    state.finish_reason = "tool_calls"
-                for chunk_item in tool_call_chunks:
-                    yield _sse(chunk_item)
+                for event in _build_stream_tool_call_events(
+                    parsed["tool_calls"],
+                    state=state,
+                ):
+                    yield event
 
             if is_complete:
                 break
@@ -1165,18 +1380,6 @@ async def _stream_response(
             _quote_preview(raw_preview),
         )
 
-    # Final chunk with finish_reason + usage.
-    usage = UsageInfo(
-        prompt_tokens=context.prompt_len,
-        completion_tokens=state.completion_tokens,
-        total_tokens=context.prompt_len + state.completion_tokens,
-    )
-    final_chunk = _stream_chunk(
-        context,
-        delta=Delta(),
-        finish_reason=state.finish_reason,
-        usage=usage,
-    )
     request_end_ts = time.time()
     elapsed_s = max(request_end_ts - context.request_start_ts, 1e-9)
     logger.opt(colors=True).debug(
@@ -1188,8 +1391,445 @@ async def _stream_response(
         elapsed_s,
         state.completion_tokens / elapsed_s if state.completion_tokens else 0.0,
     )
-    yield _sse(final_chunk)
-    yield "data: [DONE]\n\n"
+    result = _build_stream_result(context, state)
+    if worker_failed.is_set():
+        yield NormalizedStreamEvent(
+            kind="failed",
+            result=result,
+            error="Streaming worker failed",
+        )
+        return
+    yield NormalizedStreamEvent(kind="completed", result=result)
+
+
+# ---------------------------------------------------------------------------
+# Responses helpers
+# ---------------------------------------------------------------------------
+
+
+def _invalid_request_response(message: str, *, param: str | None = None) -> JSONResponse:
+    error: dict[str, Any] = {
+        "message": message,
+        "type": "invalid_request_error",
+    }
+    if param is not None:
+        error["param"] = param
+    return JSONResponse(status_code=400, content={"error": error})
+
+
+def _not_found_response(message: str, *, param: str | None = None) -> JSONResponse:
+    error: dict[str, Any] = {
+        "message": message,
+        "type": "not_found_error",
+    }
+    if param is not None:
+        error["param"] = param
+    return JSONResponse(status_code=404, content={"error": error})
+
+
+def _responses_usage_payload(result: NormalizedTurnResult) -> ResponseUsage:
+    return ResponseUsage(
+        input_tokens=result.usage.prompt_tokens,
+        input_tokens_details=ResponseUsageDetails(),
+        output_tokens=result.usage.completion_tokens,
+        output_tokens_details=ResponseUsageDetails(),
+        total_tokens=result.usage.total_tokens,
+    )
+
+
+def _responses_reasoning_payload(
+    request: NormalizedTurnRequest,
+) -> dict[str, Any] | None:
+    if not request.reasoning_effort:
+        return None
+    return {"effort": _normalize_reasoning_effort(request.reasoning_effort)}
+
+
+def _build_response_object(
+    *,
+    response_id: str,
+    created_at: int,
+    request: NormalizedTurnRequest,
+    result: NormalizedTurnResult,
+    status: str = "completed",
+    output: list[dict[str, Any]] | None = None,
+    error: dict[str, Any] | None = None,
+) -> ResponseObject:
+    return ResponseObject(
+        id=response_id,
+        created_at=created_at,
+        status=status,
+        error=error,
+        incomplete_details=None,
+        instructions=request.instructions,
+        metadata=request.metadata,
+        model=result.model,
+        output=output if output is not None else build_response_output_items(result),
+        parallel_tool_calls=True,
+        temperature=request.temperature,
+        tool_choice=request.tool_choice or "auto",
+        tools=request.tools or [],
+        top_p=request.top_p,
+        max_output_tokens=request.max_tokens,
+        previous_response_id=request.previous_response_id,
+        reasoning=_responses_reasoning_payload(request),
+        text={"format": {"type": "text"}},
+        usage=_responses_usage_payload(result),
+    )
+
+
+def _record_request_options(request: NormalizedTurnRequest) -> dict[str, Any]:
+    return {
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "max_output_tokens": request.max_tokens,
+        "tool_choice": request.tool_choice or "auto",
+        "tools": request.tools or [],
+        "reasoning": _responses_reasoning_payload(request),
+    }
+
+
+def _store_response_result(
+    *,
+    response_id: str,
+    created_at: int,
+    request: NormalizedTurnRequest,
+    result: NormalizedTurnResult,
+    output: list[dict[str, Any]],
+) -> None:
+    if not request.store:
+        return
+
+    transcript = list(request.base_transcript)
+    transcript.extend(request.transcript_additions)
+    transcript.append(build_assistant_transcript_message(result))
+    _response_store.put(
+        StoredResponseRecord(
+            id=response_id,
+            created_at=created_at,
+            model=result.model,
+            metadata=request.metadata,
+            request_options=_record_request_options(request),
+            instructions=request.instructions,
+            input_items=request.input_items,
+            previous_response_id=request.previous_response_id,
+            transcript=transcript,
+            output=output,
+            usage=_responses_usage_payload(result).model_dump(),
+            status="completed",
+            store=bool(request.store),
+        )
+    )
+
+
+def _response_object_from_record(record: StoredResponseRecord) -> ResponseObject:
+    options = record.request_options
+    return ResponseObject(
+        id=record.id,
+        created_at=record.created_at,
+        status=record.status,
+        error=None,
+        incomplete_details=None,
+        instructions=record.instructions,
+        metadata=record.metadata,
+        model=record.model,
+        output=record.output,
+        parallel_tool_calls=True,
+        temperature=options.get("temperature"),
+        tool_choice=options.get("tool_choice") or "auto",
+        tools=options.get("tools") or [],
+        top_p=options.get("top_p"),
+        max_output_tokens=options.get("max_output_tokens"),
+        previous_response_id=record.previous_response_id,
+        reasoning=options.get("reasoning"),
+        text={"format": {"type": "text"}},
+        usage=ResponseUsage(**record.usage),
+    )
+
+
+def _load_previous_transcript(previous_response_id: str | None) -> list[dict[str, Any]] | None:
+    if not previous_response_id:
+        return None
+    record = _response_store.get(previous_response_id)
+    if record is None:
+        raise InvalidRequestError(
+            f"Previous response `{previous_response_id}` was not found.",
+            param="previous_response_id",
+        )
+    return list(record.transcript)
+
+
+async def _generate_responses_object(
+    request: NormalizedTurnRequest,
+    *,
+    response_id: str,
+    created_at: int,
+    request_log_id: str | None = None,
+) -> ResponseObject:
+    result = await _generate_turn_result(request, request_log_id=request_log_id)
+    output = build_response_output_items(result)
+    _store_response_result(
+        response_id=response_id,
+        created_at=created_at,
+        request=request,
+        result=result,
+        output=output,
+    )
+    return _build_response_object(
+        response_id=response_id,
+        created_at=created_at,
+        request=request,
+        result=result,
+        output=output,
+    )
+
+
+async def _responses_stream_response(
+    request: NormalizedTurnRequest,
+    *,
+    client_request: Request | None = None,
+    request_log_id: str | None = None,
+) -> AsyncGenerator[str, None]:
+    response_id = _new_prefixed_id("resp")
+    created_at = int(time.time())
+    sequence_number = 0
+    output_items: list[dict[str, Any]] = []
+    message_item: dict[str, Any] | None = None
+    message_output_index: int | None = None
+    message_closed = False
+
+    def _event(payload: dict[str, Any]) -> str:
+        nonlocal sequence_number
+        payload["sequence_number"] = sequence_number
+        sequence_number += 1
+        return _sse(payload)
+
+    def _current_response_payload(
+        *,
+        status: str,
+        result: NormalizedTurnResult | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if result is None:
+            result = NormalizedTurnResult(
+                model=_response_model_id(request.model),
+                content=None,
+                reasoning_content=None,
+                tool_calls=[],
+                finish_reason="stop",
+                usage=NormalizedUsage(0, 0, 0),
+            )
+        return _build_response_object(
+            response_id=response_id,
+            created_at=created_at,
+            request=request,
+            result=result,
+            status=status,
+            output=output_items,
+            error=error,
+        ).model_dump()
+
+    yield _event(
+        {
+            "type": "response.created",
+            "response": _current_response_payload(status="in_progress"),
+        }
+    )
+    yield _event(
+        {
+            "type": "response.in_progress",
+            "response": _current_response_payload(status="in_progress"),
+        }
+    )
+
+    async for event in _stream_events(
+        request,
+        client_request=client_request,
+        request_log_id=request_log_id,
+    ):
+        if event.kind == "text_delta" and event.text is not None:
+            if message_item is None:
+                message_item = {
+                    "id": _new_prefixed_id("msg"),
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                }
+                message_output_index = len(output_items)
+                output_items.append(message_item)
+                yield _event(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": message_output_index,
+                        "item": message_item,
+                    }
+                )
+                part = {"type": "output_text", "text": "", "annotations": []}
+                message_item["content"].append(part)
+                yield _event(
+                    {
+                        "type": "response.content_part.added",
+                        "output_index": message_output_index,
+                        "item_id": message_item["id"],
+                        "content_index": 0,
+                        "part": part,
+                    }
+                )
+
+            message_item["content"][0]["text"] += event.text
+            yield _event(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": message_output_index,
+                    "item_id": message_item["id"],
+                    "content_index": 0,
+                    "delta": event.text,
+                    "logprobs": [],
+                }
+            )
+            continue
+
+        if event.kind == "function_call" and event.tool_call is not None:
+            function_item = {
+                "id": _new_prefixed_id("fc"),
+                "type": "function_call",
+                "status": "in_progress",
+                "call_id": event.tool_call.id,
+                "name": event.tool_call.name,
+                "arguments": "",
+            }
+            output_index = len(output_items)
+            output_items.append(function_item)
+            yield _event(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": function_item,
+                }
+            )
+            function_item["arguments"] = event.tool_call.arguments
+            yield _event(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": output_index,
+                    "item_id": function_item["id"],
+                    "delta": event.tool_call.arguments,
+                }
+            )
+            function_item["status"] = "completed"
+            yield _event(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "output_index": output_index,
+                    "item_id": function_item["id"],
+                    "arguments": event.tool_call.arguments,
+                    "name": event.tool_call.name,
+                }
+            )
+            yield _event(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": function_item,
+                }
+            )
+            continue
+
+        if event.kind == "failed" and event.result is not None:
+            failed_response = _current_response_payload(
+                status="failed",
+                result=event.result,
+                error={
+                    "message": event.error or "Streaming worker failed",
+                    "type": "server_error",
+                },
+            )
+            yield _event(
+                {
+                    "type": "response.failed",
+                    "response": failed_response,
+                }
+            )
+            return
+
+        if event.kind == "completed" and event.result is not None:
+            if message_item is None and not output_items:
+                message_item = {
+                    "id": _new_prefixed_id("msg"),
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                }
+                message_output_index = len(output_items)
+                output_items.append(message_item)
+                yield _event(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": message_output_index,
+                        "item": message_item,
+                    }
+                )
+                part = {"type": "output_text", "text": "", "annotations": []}
+                message_item["content"].append(part)
+                yield _event(
+                    {
+                        "type": "response.content_part.added",
+                        "output_index": message_output_index,
+                        "item_id": message_item["id"],
+                        "content_index": 0,
+                        "part": part,
+                    }
+                )
+
+            if message_item is not None and not message_closed:
+                yield _event(
+                    {
+                        "type": "response.output_text.done",
+                        "output_index": message_output_index,
+                        "item_id": message_item["id"],
+                        "content_index": 0,
+                        "text": message_item["content"][0]["text"],
+                        "logprobs": [],
+                    }
+                )
+                yield _event(
+                    {
+                        "type": "response.content_part.done",
+                        "output_index": message_output_index,
+                        "item_id": message_item["id"],
+                        "content_index": 0,
+                        "part": message_item["content"][0],
+                    }
+                )
+                message_item["status"] = "completed"
+                yield _event(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": message_output_index,
+                        "item": message_item,
+                    }
+                )
+                message_closed = True
+
+            _store_response_result(
+                response_id=response_id,
+                created_at=created_at,
+                request=request,
+                result=event.result,
+                output=output_items,
+            )
+            yield _event(
+                {
+                    "type": "response.completed",
+                    "response": _current_response_payload(
+                        status="completed",
+                        result=event.result,
+                    ),
+                }
+            )
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -1198,6 +1838,7 @@ async def _stream_response(
 
 _model: HarmonyModel | None = None
 _queue = RequestQueue()
+_response_store = ResponseStore()
 _stream_active_requests = 0
 
 
@@ -1324,6 +1965,113 @@ async def chat_completions(payload: ChatCompletionRequest, http_request: Request
         )
 
 
+@app.post("/v1/responses")
+async def responses_create(payload: ResponsesCreateRequest, http_request: Request):
+    request_log_id = _request_log_id(http_request)
+    try:
+        if _model is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {"message": "Model not loaded", "type": "server_error"}
+                },
+            )
+
+        previous_transcript = _load_previous_transcript(payload.previous_response_id)
+        normalized_request = normalize_responses_request(
+            payload,
+            previous_transcript=previous_transcript,
+        )
+
+        logger.opt(colors=True).debug(
+            "<yellow>{}</yellow>| rid=<cyan>{}</cyan> stream={} input_items={} tools={} maxtokens={}{}",
+            _event_label("RESPONSE_REQ"),
+            request_log_id,
+            int(bool(normalized_request.stream)),
+            len(normalized_request.input_items),
+            len(normalized_request.tools) if normalized_request.tools else 0,
+            normalized_request.max_tokens or _DEFAULT_MAX_TOKENS,
+            f" seed={normalized_request.seed}" if normalized_request.seed is not None else "",
+        )
+
+        if normalized_request.stream:
+            return StreamingResponse(
+                _responses_stream_response(
+                    normalized_request,
+                    client_request=http_request,
+                    request_log_id=request_log_id,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        response_id = _new_prefixed_id("resp")
+        created_at = int(time.time())
+        return await _queue.submit(
+            _generate_responses_object,
+            normalized_request,
+            response_id=response_id,
+            created_at=created_at,
+            request_log_id=request_log_id,
+        )
+    except InvalidRequestError as exc:
+        return _invalid_request_response(exc.message, param=exc.param)
+    except Exception:
+        logger.exception("Unhandled /v1/responses error")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "message": "Internal server error",
+                    "type": "server_error",
+                }
+            },
+        )
+
+
+@app.get("/v1/responses/{response_id}")
+async def responses_retrieve(response_id: str):
+    record = _response_store.get(response_id)
+    if record is None:
+        return _not_found_response(
+            f"Response `{response_id}` was not found.",
+            param="response_id",
+        )
+    return _response_object_from_record(record)
+
+
+@app.delete("/v1/responses/{response_id}")
+async def responses_delete(response_id: str):
+    deleted = _response_store.delete(response_id)
+    if not deleted:
+        return _not_found_response(
+            f"Response `{response_id}` was not found.",
+            param="response_id",
+        )
+    return ResponseDeleted(id=response_id)
+
+
+@app.get("/v1/responses/{response_id}/input_items")
+async def responses_input_items(response_id: str):
+    record = _response_store.get(response_id)
+    if record is None:
+        return _not_found_response(
+            f"Response `{response_id}` was not found.",
+            param="response_id",
+        )
+    item_ids = [item.get("id") for item in record.input_items if item.get("id")]
+    return ResponseInputItemsList(
+        data=record.input_items,
+        first_id=item_ids[0] if item_ids else None,
+        last_id=item_ids[-1] if item_ids else None,
+        has_more=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI & entry point
 # ---------------------------------------------------------------------------
@@ -1365,9 +2113,25 @@ def parse_args(argv: list[str] | None = None):
         action="store_true",
         help="Emit one INFO access log line per HTTP request",
     )
+    p.add_argument(
+        "--responses-store-max-items",
+        type=int,
+        default=256,
+        help="Maximum number of stored /v1/responses records kept in memory",
+    )
+    p.add_argument(
+        "--responses-store-max-bytes",
+        type=int,
+        default=64 * 1024 * 1024,
+        help="Maximum approximate in-memory size of stored /v1/responses records",
+    )
     args = p.parse_args(argv)
     if args.debug_raw_preview_chars < 0:
         p.error("--debug-raw-preview-chars must be >= 0")
+    if args.responses_store_max_items < 1:
+        p.error("--responses-store-max-items must be >= 1")
+    if args.responses_store_max_bytes < 1024:
+        p.error("--responses-store-max-bytes must be >= 1024")
     return args
 
 
@@ -1388,6 +2152,7 @@ def main(argv: list[str] | None = None) -> None:
     global _STARTUP_READY_SUMMARY
     global _STARTUP_DEBUG_ARGS
     global _model
+    global _response_store
 
     args = parse_args(argv)
     configure_logging(args.log_level, args.log_file)
@@ -1402,7 +2167,9 @@ def main(argv: list[str] | None = None) -> None:
         f"log_level={args.log_level}, "
         f"log_file={args.log_file or '-'}, "
         f"debug_raw_preview_chars={args.debug_raw_preview_chars}, "
-        f"http_access_log={'true' if args.http_access_log else 'false'}"
+        f"http_access_log={'true' if args.http_access_log else 'false'}, "
+        f"responses_store_max_items={args.responses_store_max_items}, "
+        f"responses_store_max_bytes={args.responses_store_max_bytes}"
         ")"
     )
     
@@ -1413,6 +2180,10 @@ def main(argv: list[str] | None = None) -> None:
             
     logger.opt(colors=True).info("Requesting GPT-OSS model")
     _model = HarmonyModel(args.model, context_length=args.context_length)
+    _response_store = ResponseStore(
+        max_items=args.responses_store_max_items,
+        max_bytes=args.responses_store_max_bytes,
+    )
     logger.opt(colors=True).info("Model loaded and ready")
     logger.opt(colors=True).info("Listening on <cyan>{}:{}</cyan>", args.host, args.port)
     

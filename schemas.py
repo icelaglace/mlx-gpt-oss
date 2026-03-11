@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Request models
@@ -31,9 +31,39 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     reasoning_effort: Literal["low", "medium", "high"] | None = None
-    chat_template_kwargs: dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
     stop: str | list[str] | None = None
+
+
+class ResponsesReasoning(BaseModel):
+    effort: Literal["low", "medium", "high"] | None = None
+
+
+class ResponsesTextConfig(BaseModel):
+    format: dict[str, Any] | None = None
+
+
+class ResponsesCreateRequest(BaseModel):
+    """OpenAI ``/v1/responses`` request body."""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    input: str | dict[str, Any] | list[Any]
+    instructions: str | None = None
+    stream: bool = False
+    store: bool | None = None
+    previous_response_id: str | None = None
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    top_p: float | None = Field(None, gt=0.0, le=1.0)
+    max_output_tokens: int | None = Field(None, ge=1)
+    seed: int | None = Field(None, ge=0)
+    metadata: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    reasoning: ResponsesReasoning | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
+    text: ResponsesTextConfig | dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,3 +176,76 @@ class HealthCheckStatus(BaseModel):
     model_id: str | None = None
     active_requests: int = 0
     queued_requests: int = 0
+
+
+class ResponseOutputText(BaseModel):
+    type: str = "output_text"
+    text: str
+    annotations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ResponseMessageItem(BaseModel):
+    id: str
+    type: str = "message"
+    role: str = "assistant"
+    status: str = "completed"
+    content: list[ResponseOutputText]
+
+
+class ResponseFunctionCallItem(BaseModel):
+    id: str
+    type: str = "function_call"
+    status: str = "completed"
+    call_id: str
+    name: str
+    arguments: str
+
+
+class ResponseUsageDetails(BaseModel):
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+
+
+class ResponseUsage(BaseModel):
+    input_tokens: int
+    input_tokens_details: ResponseUsageDetails
+    output_tokens: int
+    output_tokens_details: ResponseUsageDetails
+    total_tokens: int
+
+
+class ResponseObject(BaseModel):
+    id: str
+    object: str = "response"
+    created_at: int
+    status: str
+    error: dict[str, Any] | None = None
+    incomplete_details: dict[str, Any] | None = None
+    instructions: str | None = None
+    metadata: dict[str, Any] | None = None
+    model: str
+    output: list[dict[str, Any]]
+    parallel_tool_calls: bool = True
+    temperature: float | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    top_p: float | None = None
+    max_output_tokens: int | None = None
+    previous_response_id: str | None = None
+    reasoning: dict[str, Any] | None = None
+    text: dict[str, Any] | None = None
+    usage: ResponseUsage | None = None
+
+
+class ResponseDeleted(BaseModel):
+    id: str
+    object: str = "response.deleted"
+    deleted: bool = True
+
+
+class ResponseInputItemsList(BaseModel):
+    object: str = "list"
+    data: list[dict[str, Any]]
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False

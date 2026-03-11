@@ -6,9 +6,11 @@ Built with `mlx-lm` (inference), `openai-harmony` (prompt formatting), and FastA
 ## Feature List
 
 - OpenAI-style `/v1/chat/completions` endpoint
+- OpenAI-style `/v1/responses` endpoint
 - Streaming (`SSE`) and non-streaming responses
 - Harmony `reasoning_effort` support (`low`, `medium`, `high`)
 - OpenAI tool-calling response format
+- Responses API function-calling and `previous_response_id` support
 - Robust Harmony tool-calling parser and stream recovery paths
 - Usage token counts in responses
 - `/health` queue stats and `/v1/models` compatibility endpoint
@@ -44,6 +46,10 @@ mlx-gpt-oss --model mlx-community/gpt-oss-20b-MXFP4-Q8
 | `/health` | `GET` | Server health + active/queued request counts |
 | `/v1/models` | `GET` | Loaded model metadata |
 | `/v1/chat/completions` | `POST` | OpenAI-compatible chat completion |
+| `/v1/responses` | `POST` | OpenAI-compatible Responses API create |
+| `/v1/responses/{response_id}` | `GET` | Retrieve stored response |
+| `/v1/responses/{response_id}` | `DELETE` | Delete stored response |
+| `/v1/responses/{response_id}/input_items` | `GET` | Retrieve stored request input items |
 
 ## Chat Completions Notes
 
@@ -52,6 +58,21 @@ mlx-gpt-oss --model mlx-community/gpt-oss-20b-MXFP4-Q8
 - `top_k` is accepted but generation remains pinned to `top_k=0` for GPT-OSS behavior.
 - `reasoning_effort` can be set directly, or via `chat_template_kwargs.reasoning_effort`.
 - Streaming returns `chat.completion.chunk` events and ends with `[DONE]`.
+
+## Responses API Notes
+
+- Supported input types are text message items, replayed `function_call` items, and `function_call_output` items.
+- Supported tools are custom `function` tools only.
+- Stored responses are process-local, in-memory, and bounded by LRU eviction.
+- `previous_response_id` reuses stored conversation transcript, but does not carry forward prior `instructions`.
+
+## Responses API Limits
+
+- No multimodal inputs (`image`, `audio`, `file`, etc.)
+- No hosted OpenAI tools such as `web_search`, `file_search`, or `code_interpreter`
+- No structured output / non-plain-text `text.format`
+- No `parallel_tool_calls=false`
+- No named/required tool forcing; `tool_choice` supports `auto` and `none`
 
 ## Tool Calling Reliability
 
@@ -71,6 +92,8 @@ mlx-gpt-oss --model mlx-community/gpt-oss-20b-MXFP4-Q8
 | `--log-file` | disabled | Optional rotating file log output |
 | `--debug-raw-preview-chars` | `0` | In `DEBUG`, preview N chars of prompts/output |
 | `--http-access-log` | `False` | Emit one access log line per HTTP request |
+| `--responses-store-max-items` | `256` | Max stored `/v1/responses` records kept in memory |
+| `--responses-store-max-bytes` | `67108864` | Approximate max in-memory bytes for stored responses |
 
 ## Security
 
