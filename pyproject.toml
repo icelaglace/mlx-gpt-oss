@@ -1,6 +1,6 @@
 [project]
 name = "mlx-gpt-oss"
-version = "1.0.0"
+version = "1.0.2"
 description = "Minimal OpenAI-compatible server for GPT-OSS models on Apple Silicon with MLX"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.11"
